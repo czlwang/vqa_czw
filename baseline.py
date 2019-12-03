@@ -15,8 +15,12 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torchvision import transforms, utils
 from PIL import Image
+import yaml
 
 device = torch.device("cpu")
+
+with open("config.yml", 'r') as ymlfile:
+    cfg = yaml.load(ymlfile, Loader=yaml.FullLoader)
 
 class VQADataset(Dataset):
     """vqa dataset."""
@@ -102,7 +106,7 @@ def readQAText(data_df):
     question_lang = Lang("questions")
     answer_lang = Lang("answers")
     #for idx in range(len(questions)):
-    for idx in range(10):
+    for idx in range(len(data_df)):
         sample = data_df.iloc[idx]
         answer = sample["multiple_choice_answer"]
         question = sample["question"]
@@ -162,8 +166,6 @@ class VQA_Model(nn.Module):
         # # we need to manually concatenate the final states for both directions
         # final is a tuple of (hidden, cell)
         fwd_final_hidden = final[0][0:final[0].size(0):2]
-        #print("final_fwd size")
-        #print(fwd_final_hidden.size())
         bwd_final_hidden = final[0][1:final[0].size(0):2]
         final_hidden = torch.cat([fwd_final_hidden, bwd_final_hidden], dim=2)  # [num_layers, batch, 2*dim]
 
@@ -182,14 +184,18 @@ class VQA_Model(nn.Module):
 
 def run_epoch(model, vqa_dataloader, question_lang, answer_lang, criterion, optim):
     loss = 0
-    for batch in vqa_dataloader:
+    for idx, batch in enumerate(vqa_dataloader):
         img = batch["image"]
         question_tensor, lengths = batch_questions(batch['question'], question_lang)
         out = model.forward(question_tensor, lengths, img)
         answer_tensors = batch_answers(batch["answer"], answer_lang)
         loss = criterion(out, answer_tensors)
         loss += loss
-        break
+
+        if idx < cfg["num_batches"]:
+            break
+
+    print(loss)
     loss.backward()          
     optim.step()
     optim.zero_grad()
@@ -233,8 +239,8 @@ def main():
     vqa_dataloader = torch.utils.data.DataLoader(vqa_dataset, batch_size=4)
     model = make_model(question_lang, 1000)
     optim = torch.optim.Adam(model.parameters(), lr=10e-3)
-    num_epochs = 10
-    train(model, vqa_dataloader, question_lang, answer_lang, num_epochs, optim)
+    train(model, vqa_dataloader, question_lang, 
+          answer_lang, cfg["num_epochs"], optim)
 
 if __name__ == '__main__':
     main()
