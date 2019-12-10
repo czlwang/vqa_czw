@@ -456,9 +456,9 @@ def eval_accuracy(model, vqa_dataloader, question_lang, answer_lang, amr_lang, o
         count += sum([x==y for x,y in zip(pred_answers, normalized_answers)])
         #print([x==y for x,y in zip(pred_answers, normalized_answers)])
         #print(list(zip(pred_answers, normalized_answers)))
-        trg_amrs = batch["amr"]
-        pred_amrs = [' ' .join(indicesToWords(amr_lang, x)) for x in amr_tokens]
-        pred_amrs = [stripEOS(x) for x in pred_amrs]
+        trg_amrs = [x.strip() for x in batch["amr"]]
+        pred_amrs = [' '.join(indicesToWords(amr_lang, x)) for x in amr_tokens]
+        pred_amrs = [stripEOS(x).strip() for x in pred_amrs]
         amr_count += sum([x==y for x,y in zip(pred_amrs, trg_amrs)])
         denom += len(pred_amrs)
         #print(list(zip(pred_amrs, trg_amrs)))
@@ -630,7 +630,7 @@ def main():
         f.write(f'train amr {train_accuracy_amr}\n')
         f.write(f'test amr {test_accuracy_amr}\n')
 
-    model.save(model.state_dict(), f'{OUT_DIR}/{EXP_NAME}/best_model.pt')
+    torch.save(model.state_dict(), f'{OUT_DIR}/{EXP_NAME}/best_model.pt')
     print("done")
 
 if __name__ == '__main__':
