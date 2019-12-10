@@ -19,8 +19,9 @@ from torchvision import transforms, utils
 from PIL import Image
 import yaml
 import pathlib
+import sys
 
-with open("config.yml", 'r') as ymlfile:
+with open(sys.argv[1], 'r') as ymlfile:
     cfg = yaml.load(ymlfile, Loader=yaml.FullLoader)
     print(cfg)
 
