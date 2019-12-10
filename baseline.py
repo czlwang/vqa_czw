@@ -8,6 +8,7 @@ import json
 import torch
 import pandas as pd
 import numpy as np
+import copy
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
@@ -81,10 +82,10 @@ class VQADataset(Dataset):
 
 class Lang:
     def __init__(self, name):
-        self.SOS_TOKEN = 1
-        self.EOS_TOKEN = 2
-        self.PAD_TOKEN = 3
-        self.UNK_TOKEN = 4
+        self.SOS_TOKEN = 0
+        self.EOS_TOKEN = 1
+        self.PAD_TOKEN = 2
+        self.UNK_TOKEN = 3
         self.name = name
         self.word2count = {}
         self.index2word = {self.SOS_TOKEN: "SOS", 
@@ -111,8 +112,8 @@ class Lang:
             self.word2count[word] += 1
 
 def normalizeString(s):
-    s = re.sub(r"([.!?])", r" \1", s)
-    s = re.sub(r"[^a-zA-Z.!?0-9]+", r" ", s)
+    s = re.sub(r"([.!?()])", r" \1", s)
+    s = re.sub(r"[^a-zA-Z.!?0-9:\-]+", r" ", s)
     return s
 
 def normalizeAnswerString(s):
@@ -126,13 +127,16 @@ def indexesFromSentence(lang, sentence):
 
 def readQAText(data_df):
     question_lang = Lang("questions")
+    amr_lang = Lang("amr")
     answer_lang_temp = Lang("answers")
     #for idx in range(len(questions)):
     for idx in range(len(data_df)):
         sample = data_df.iloc[idx]
         answer = sample["multiple_choice_answer"]
         question = sample["question"]
+        amr = sample["amr"]
         question_lang.addSentence(normalizeString(question))
+        amr_lang.addSentence(normalizeString(amr))
         answer_lang_temp.addSentence(normalizeAnswerString(answer))
 
     most_common_answers = sorted(answer_lang_temp.word2count.items(), key = lambda x: x[1])
@@ -141,7 +145,7 @@ def readQAText(data_df):
     for answer in most_common_answers[:996]:
         answer_lang.addWord(answer[0])
 
-    return question_lang, answer_lang
+    return question_lang, answer_lang, amr_lang
 
 def batch_answers(answers, answer_lang):
     tensors = []
@@ -151,14 +155,17 @@ def batch_answers(answers, answer_lang):
     tensors = torch.cat(tensors)
     return tensors
 
-def batch_text(texts, text_lang):
+def batch_text(texts, text_lang, EOS_TOKEN=False, SOS_TOKEN=False):
     tensors = []
     normalized_texts = [normalizeString(q) for q in texts]
     text_idxs = [indexesFromSentence(text_lang, q) for q in normalized_texts]
-    lengths = [len(q) + 1 for q in text_idxs] 
+    lengths = [len(q) + EOS_TOKEN + SOS_TOKEN for q in text_idxs] 
     max_len = max(lengths)
     for indexes in text_idxs:
-        indexes.append(text_lang.EOS_TOKEN)
+        if SOS_TOKEN:
+            indexes.insert(0, text_lang.SOS_TOKEN)
+        if EOS_TOKEN:
+            indexes.append(text_lang.EOS_TOKEN)
         indexes = indexes + [text_lang.PAD_TOKEN]*(max_len-len(indexes))
         tensors.append(torch.tensor(indexes, dtype=torch.long, device=DEVICE))
     tensors = torch.stack(tensors)
@@ -184,9 +191,6 @@ class Decoder(nn.Module):
                           batch_first=True, dropout=dropout)
                  
         # to initialize from the final encoder state
-        self.bridge_hidden = nn.Linear(2*hidden_size, hidden_size, bias=True) if bridge else None
-        self.bridge_cell = nn.Linear(2*hidden_size, hidden_size, bias=True) if bridge else None
-
         self.dropout_layer = nn.Dropout(p=dropout)
 
         #input is prev embedding (emb_size), output (hidden_size), and context (num_directions*hidden_size)
@@ -224,9 +228,9 @@ class Decoder(nn.Module):
         # pre_output is actually used to compute the prediction
         return output, hidden, pre_output
     
-    def forward(self, trg, encoder_hidden, encoder_final, 
-                src_lengths, teacher_forcing_ratio=1.0,
-                hidden=None, max_len=None):
+    def forward(self, trg, encoder_hidden, 
+                src_lengths, hidden, teacher_forcing_ratio=None,
+                max_len=None):
         """Unroll the decoder one step at a time.
            trg is (batch_len x trg_max_seq_len)
            encoder_hidden is (batch_len x src_max_seq_len x num_directions*hidden_layer_size)
@@ -241,21 +245,18 @@ class Decoder(nn.Module):
         if max_len is None:
             max_len = trg.size(1)
 
-        # initialize decoder hidden state
-        if hidden is None:
-            hidden = self.init_hidden(encoder_final)
         # pre-compute projected encoder hidden states
         # (the "keys" for the attention mechanism)
         # this is only done for efficiency
         proj_key = self.attention.key_layer(encoder_hidden)
         out = torch.zeros((trg.shape[0], self.trg_embed.num_embeddings, max_len), device=trg.device)
-
         # unroll the decoder RNN for max_len steps
         teacher_forcing = random.random() < teacher_forcing_ratio
         for i in range(max_len):
             if i == 0:
                 prev_y = trg[:,0].unsqueeze(1)
             
+            #print(prev_y)
             prev_embed = self.trg_embed(prev_y)
             output, hidden, pre_output = self.forward_step(prev_embed,
                                                            encoder_hidden, 
@@ -264,6 +265,7 @@ class Decoder(nn.Module):
                                                            hidden)
 
             prob = self.softmax(pre_output).squeeze(1)
+            #print(prob.shape)
             out[:,:,i] = prob
             if not teacher_forcing:
                 words = prob.topk(1, dim=1)[1]
@@ -272,15 +274,6 @@ class Decoder(nn.Module):
                 prev_y = trg[:, i+1].unsqueeze(1)
         return out, hidden
 
-    def init_hidden(self, encoder_final):
-        """Returns the initial decoder state,
-        conditioned on the final encoder state."""
-
-        if encoder_final is None:
-            return None  # start with zeros
-
-        return (torch.tanh(self.bridge_hidden(encoder_final[0])),
-                torch.tanh(self.bridge_cell(encoder_final[1])))
 
 class BahdanauAttention(nn.Module):
     """Implements Bahdanau (MLP) ttention"""
@@ -316,7 +309,13 @@ class BahdanauAttention(nn.Module):
             mask.append([[1]*length + [0]*(max_len - length)])
 
         tensor_mask = torch.Tensor(mask).ne(1)
-        tensor_mask = tensor_mask.to(DEVICE)
+        try:
+            tensor_mask = tensor_mask.to(DEVICE)
+        except RuntimeError as e:
+            print(e)
+            print(mask)
+            print(tensor_mask.shape)
+            exit()
      
         scores.data.masked_fill_(tensor_mask, -float('inf'))
         
@@ -337,26 +336,34 @@ class VQA_Model(nn.Module):
         self.embedding = nn.Embedding(input_size, emb_size)
         self.rnn = nn.LSTM(emb_size, hidden_size, num_layers, 
                           batch_first=True, bidirectional=True, dropout=dropout)
-        self.proj_q = nn.Linear(2*hidden_size, 2*hidden_size, bias=False)
+        self.proj_q = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        self.bridge_hidden = nn.Linear(2*hidden_size, hidden_size, bias=True)
+        self.bridge_cell = nn.Linear(2*hidden_size, hidden_size, bias=True) 
 
         model_cut  = nn.Sequential(*list(resnet.children())[:-1])
         self.resnet = model_cut
 
-        self.proj_im_1 = nn.Linear(2048, 2*hidden_size, bias=False)
+        self.proj_im_1 = nn.Linear(2048, hidden_size, bias=False)
         #self.proj_im_2 = nn.Linear(2*hidden_size, 2*hidden_size)
 
-        self.q_im_embed = nn.Linear(2*hidden_size, hidden_size, bias=False)
-        self.fc1 = nn.Linear(2*hidden_size, 2*hidden_size)
-        self.fc2 = nn.Linear(2*hidden_size,2*hidden_size)
-        self.fc3 = nn.Linear(2*hidden_size, num_answers)
+        self.q_im_embed = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, num_answers)
         self.decoder = decoder 
 
-    def forward(self, question, lengths, image, amr):
-        """
-        Applies a bidirectional LSTM
-        The input mini-batch x needs to be sorted by length.
-        x should have dimensions [batch, time, dim].
-        """
+    def init_hidden(self, encoder_final):
+        """Returns the initial decoder state,
+        conditioned on the final encoder state."""
+
+        if encoder_final is None:
+            return None  # start with zeros
+
+        return (torch.tanh(self.bridge_hidden(encoder_final[0])),
+                torch.tanh(self.bridge_cell(encoder_final[1])))
+
+    def embed_question(self, question, lengths):
         embedded = self.embedding(question)
         packed = pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
         output, final = self.rnn(packed)
@@ -375,105 +382,163 @@ class VQA_Model(nn.Module):
         fwd_final_cell = final[1][0:final[1].size(0):2]
         bwd_final_cell = final[1][1:final[1].size(0):2]
         final_cell = torch.cat([fwd_final_cell, bwd_final_cell], dim=2)  # [num_layers, batch, 2*dim]
+        encoder_final = (final_hidden, final_cell)
+        return output, encoder_final
 
-        q_embed = self.proj_q(top_final_hidden)
+    def embed_image(self, image):
         im_embed = self.resnet(image)
         im_embed = im_embed.squeeze(-1)
         im_embed = im_embed.squeeze(-1)#shape is [batch, 2048, 1, 1] before squeezing
-        im_embed = self.proj_im_1(im_embed)
+        im_embed = torch.tanh(self.proj_im_1(im_embed))
         #im_embed = self.proj_im_2(im_embed)
+        return im_embed
+
+    def forward(self, question, lengths, image, amr, teacher_forcing_ratio=None):
+        encoder_hidden, encoder_final = self.embed_question(question, lengths)
+        bridge_hidden = self.init_hidden(encoder_final)
+        q_embed = torch.tanh(self.proj_q(bridge_hidden[0][1]))
+
+        im_embed = self.embed_image(image)
 
         #concat = torch.cat((q_embed, im_embed), dim=1)
         q_im_embed = torch.mul(q_embed, im_embed)
         #q_im_embed = q_embed
-        q_im_embed = self.fc1(q_im_embed)
-        q_im_embed = self.fc2(q_im_embed)
-        q_im_embed = self.fc3(q_im_embed)
+        q_im_embed = torch.tanh(self.fc1(q_im_embed))
+        q_im_embed = torch.tanh(self.fc2(q_im_embed))
+        q_im_embed = torch.tanh(self.fc3(q_im_embed))
         pred = F.log_softmax(q_im_embed, dim=-1)
-
-        encoder_hidden = output
-        encoder_final = (final_hidden, final_cell)
         amr_probs, _ = self.decoder(amr, encoder_hidden,
-                                   encoder_final, lengths,  
-                                   teacher_forcing_ratio=1.0)
+                                    lengths, bridge_hidden,
+                                    teacher_forcing_ratio=teacher_forcing_ratio)
 
         amr_tokens = torch.max(amr_probs.transpose(2,1), dim=2)[1]
-        amr_tokens = amr_tokens.detach()
-
+        amr_tokens = amr_tokens.cpu().detach()
+            
         return pred, amr_probs, amr_tokens
 
-def run_epoch(model, vqa_dataloader, question_lang, answer_lang, criterion, optim):
+def run_epoch(model, vqa_dataloader, question_lang, answer_lang, amr_lang, criterion, optim, teacher_forcing_ratio=None, alpha=1.0):
     total_loss = 0
     for idx, batch in enumerate(vqa_dataloader):
         img = batch["image"]
-        question_tensor, lengths = batch_text(batch['question'], question_lang)
-        out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, question_tensor)
+        question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
+        amr_tensor, amr_lengths = batch_text(batch['amr'], amr_lang, EOS_TOKEN=False, SOS_TOKEN=True)
+        amr_tensor_trg, amr_lengths_trg = batch_text(batch['amr'], amr_lang, EOS_TOKEN=True, SOS_TOKEN=False)
+        out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, 
+                                                   amr_tensor, teacher_forcing_ratio=teacher_forcing_ratio)
         answer_tensors = batch_answers(batch["answer"], answer_lang)
         assert max(answer_tensors) < 1000
         loss = criterion(out, answer_tensors)
-        loss += criterion(amr_probs, question_tensor)
+        loss += alpha*criterion(amr_probs, amr_tensor_trg)
         total_loss += loss.item()
         loss.backward()          
         optim.step()
         optim.zero_grad()
     return total_loss
 
-def eval_accuracy(model, vqa_dataloader, question_lang, answer_lang, save_file=None):
+def eval_accuracy_light(model, vqa_dataloader, question_lang, answer_lang, amr_lang, out_file=None):
+    count, amr_count = 0.0, 0.0
+    stripEOS = lambda x: re.sub("{}.*".format("EOS"), "", x)
+    if out_file:
+        f = open(out_file, "w")
+    for idx, batch in enumerate(vqa_dataloader):
+        question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
+        img = batch["image"]
+        question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
+        amr_tensor, amr_lengths = batch_text(batch['amr'], amr_lang, EOS_TOKEN=False, SOS_TOKEN=True)
+
+        with torch.no_grad():
+            out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, amr_tensor, teacher_forcing_ratio=0.0)
+        max_tokens = torch.max(out,1)[1]
+        pred_answers = [answer_lang.getWord(x) for x in max_tokens]
+        normalized_answers = [normalizeAnswerString(x) for x in batch["answer"]]
+        count += sum([x==y for x,y in zip(pred_answers, normalized_answers)])
+        trg_amrs = batch["amr"]
+        pred_amrs = [' ' .join(indicesToWords(amr_lang, x)) for x in amr_tokens]
+        pred_amrs = [stripEOS(x) for x in pred_amrs]
+        amr_count += sum([x==y for x,y in zip(pred_amrs, trg_amrs)])
+
+        if out_file:
+            for i in range(len(max_tokens)):
+                f.write(batch["question"][i] + "\n")
+                f.write(normalized_answers[i] + "\n")
+                f.write(pred_answers[i] + "\n")
+                f.write(trg_amrs[i] + "\n")
+                f.write(pred_amrs[i] + "\n\n")
+    if out_file:
+        f.close()
+    return count/len(vqa_dataloader), amr_count/len(vqa_dataloader)
+ 
+def eval_accuracy(model, vqa_dataloader, question_lang, answer_lang, amr_lang, save_file=None):
     """
     assume batches are size 1
     """
     count = 0.0
     with open(save_file, "w") as f:
         for idx, batch in enumerate(vqa_dataloader):
-            question_tensor, lengths = batch_text(batch['question'], question_lang)
+            question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
             img = batch["image"]
-            question_tensor, lengths = batch_text(batch['question'], question_lang)
+            question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
+            amr_tensor, amr_lengths = batch_text(batch['amr'], amr_lang, EOS_TOKEN=False, SOS_TOKEN=True)
             with torch.no_grad():
-                out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, question_tensor)
+                out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, amr_tensor, teacher_forcing_ratio=0.0)
             max_token = torch.max(out,1)[1].item()
             pred_answer = answer_lang.getWord(max_token)
             normalized_answer = normalizeAnswerString(batch["answer"][0])
-            f.write(batch["question"][0] + "\n")
-            f.write(normalized_answer + "\n")
-            f.write(pred_answer + "\n\n")
+            trg_amr = ' '.join(batch["amr"])
             if normalized_answer == pred_answer:
                 count += 1 
     return count/len(vqa_dataloader) 
  
-def print_examples(model, vqa_dataloader, question_lang, answer_lang, num_examples=3):
-    """
-    assume batches are size 1
-    """
-    for idx, batch in enumerate(vqa_dataloader):
-        question_tensor, lengths = batch_text(batch['question'], question_lang)
-        print(f'Example {idx}')
-        print("question: ", batch["question"])
-        print("answer: ", batch["answer"])
-        print("amr: ", batch["amr"])
-        img = batch["image"]
-        question_tensor, lengths = batch_text(batch['question'], question_lang)
-        with torch.no_grad():
-            out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, question_tensor)
-        max_token = torch.max(out,1)[1].item()
-        print("pred: ", answer_lang.getWord(max_token))
-        
-        if idx >= num_examples:
-            break
+def indicesToWords(lang, sentence):
+    return [lang.getWord(int(x)) for x in sentence]
 
-def train(model, vqa_dataloader, val_dataloader, question_lang, answer_lang, num_epochs, optim):
-    criterion = nn.NLLLoss(reduction="sum")
+def print_examples(model, vqa_dataloader, question_lang, answer_lang, amr_lang, num_examples=3):
+    stripEOS = lambda x: re.sub("{}.*".format("EOS"), "", x)
+    for idx, batch in enumerate(vqa_dataloader):
+        question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
+        amr_tensor, amr_lengths = batch_text(batch['amr'], amr_lang, EOS_TOKEN=False, SOS_TOKEN=True)
+        img = batch["image"]
+        with torch.no_grad():
+            out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, amr_tensor, teacher_forcing_ratio=0.0)
+        max_tokens = torch.max(out,1)[1]
+
+        for count in range(len(batch['question'])):
+            print(f'Example {count}')
+            print("question: ", batch["question"][count])
+            print("answer: ", batch["answer"][count])
+            print("amr: ", batch["amr"][count])
+            max_token = max_tokens[count]
+            print("pred answer: ", answer_lang.getWord(max_token))
+            pred_amr = ' '.join(indicesToWords(amr_lang, amr_tokens[count]))
+            pred_amr = stripEOS(pred_amr)
+            print("pred amr: ", pred_amr)
+        
+        if count >= num_examples:
+            return
+
+def train(model, vqa_dataloader, val_dataloader, question_lang, answer_lang, amr_lang, num_epochs, optim, alpha):
+    criterion = nn.NLLLoss(reduction="mean", ignore_index=amr_lang.PAD_TOKEN)
+    max_acc = 0
+    best_model_wts = None
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch}')
         model.train()
-        loss = run_epoch(model, vqa_dataloader, question_lang, answer_lang, criterion, optim)
+        loss = run_epoch(model, vqa_dataloader, question_lang, answer_lang, amr_lang, criterion, optim, teacher_forcing_ratio=1.0, alpha=alpha)
         writer.add_scalar("loss", loss, epoch)
         print("loss", loss)
         model.eval()
         with torch.no_grad():
-            print_examples(model, val_dataloader, question_lang, answer_lang)
-            #val_accuracy = eval_accuracy(model, val_dataloader, question_lang, answer_lang, "/tmp/eval.txt")
-            #print("val_accuracy", val_accuracy)
-            #writer.add_scalar("val_accuracy", val_accuracy, epoch)
+            print_examples(model, val_dataloader, question_lang, answer_lang, amr_lang)
+            val_accuracy, val_accuracy_amr = eval_accuracy_light(model, val_dataloader, question_lang, answer_lang, amr_lang)
+            print("val_accuracy", val_accuracy)
+            print("val_accuracy_amr", val_accuracy_amr)
+            writer.add_scalar("val_accuracy", val_accuracy, epoch)
+            writer.add_scalar("val_accuracy_amr", val_accuracy_amr, epoch)
+            if val_accuracy >= max_acc:
+                max_acc = val_accuracy
+                best_model_wts = copy.deepcopy(model.state_dict())
+    model.load_state_dict(best_model_wts)
+    return model
 
 # To keep things easy we also keep the `Softmax` class the same. 
 # It simply projects the pre-output layer ($x$ in the `forward` function below) to obtain the output layer, so that the final dimension is the target vocabulary size.
@@ -489,18 +554,19 @@ class Softmax(nn.Module):
         """
         return F.log_softmax(self.proj(x), dim=-1)
 
-def make_model(question_lang, num_answers):
+def make_model(question_lang, amr_lang, num_answers):
     resnet = torch.hub.load('pytorch/vision:v0.4.2', 'resnet50', pretrained=True) 
 
     num_layers = 2
     emb_size = 200
     dropout = 0.5
     hidden_size = cfg["hidden_size"]
-    vocab_size = question_lang.n_words
-    attention1 = BahdanauAttention(hidden_size)
-    decoder = Decoder(emb_size, hidden_size, Softmax(hidden_size, vocab_size), 
-                      nn.Embedding(vocab_size, emb_size),
-                      attention1, num_layers=num_layers, dropout=dropout)
+    question_vocab_size = question_lang.n_words
+    amr_vocab_size = amr_lang.n_words
+    attention = BahdanauAttention(hidden_size)
+    decoder = Decoder(emb_size, hidden_size, Softmax(hidden_size, amr_vocab_size), 
+                      nn.Embedding(amr_vocab_size, emb_size),
+                      attention, num_layers=num_layers, dropout=dropout)
     model = VQA_Model(question_lang.n_words, emb_size, hidden_size, num_layers,
                       num_answers, resnet, decoder, dropout=dropout)
     return model.to(DEVICE)
@@ -521,44 +587,62 @@ def make_df(json_file, annotation_json, amr_file):
     data_df["amr"] = amr
     return data_df
 
-def main():
+def make_splits():
     train_json = 'Questions_Train_abstract_v002/MultipleChoice_abstract_v002_train2015_questions.json'
     val_json = 'Questions_Val_abstract_v002/MultipleChoice_abstract_v002_val2015_questions.json'
-    train_images = 'scene_img_abstract_v002_train2015'
-    val_images = 'scene_img_abstract_v002_val2015'
-    transform = transforms.Compose([transforms.Resize(224),
-                                    transforms.CenterCrop(224),
-                                    transforms.ToTensor(),
-                                    #transforms.Normalize(mean=[0.485, 0.456, 0.406],
-#                                                         std=[0.229, 0.224, 0.225])
-                                   ])
     train_df = make_df(train_json, 'abstract_v002_train2015_annotations.json', 'train_amr.txt')
     val_df = make_df(val_json, 'abstract_v002_val2015_annotations.json', 'val_amr.txt')
     
     train_df = train_df.iloc[:cfg["num_train_examples"]]
-    val_df = val_df.iloc[:cfg["num_val_examples"]]
+    n_val = int(len(val_df)*cfg["val_test_split"])
+    val_df = val_df.iloc[:n_val]
+    test_df = val_df.iloc[n_val:]
+    return train_df, val_df, test_df
 
+def main():
+    transform = transforms.Compose([transforms.Resize(224),
+                                    transforms.CenterCrop(224),
+                                    transforms.ToTensor(),
+                                    #transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                         #std=[0.229, 0.224, 0.225])
+                                   ])
+    train_df, val_df, test_df = make_splits()
+    train_images = 'scene_img_abstract_v002_train2015'
+    val_images = 'scene_img_abstract_v002_val2015'
     train_dataset = VQADataset(train_df, root_dir=train_images, split="train",
                                transform=transform)
     val_dataset = VQADataset(val_df, root_dir=val_images, split="val",
                              transform=transform)
-    #TODO change val to actually val
-    #val_dataset = VQADataset(train_df, root_dir=train_images, split="train",
-    #                         transform=transform)
-
-    question_lang, answer_lang = readQAText(train_df)
-    vqa_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=cfg["batch_size"])
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=1)
-    model = make_model(question_lang, 1000)
+    test_dataset = VQADataset(test_df, root_dir=val_images, split="val",
+                             transform=transform)
+    question_lang, answer_lang, amr_lang = readQAText(train_df)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=cfg["batch_size"])
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=cfg["val_batch_size"])
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1)
+    model = make_model(question_lang, amr_lang, 1000)
     optim = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-    train(model, vqa_dataloader, val_dataloader, question_lang, 
-          answer_lang, cfg["num_epochs"], optim)
+    model = train(model, train_loader, val_loader, question_lang, answer_lang,
+          amr_lang, cfg["num_epochs"], optim, cfg["alpha"])
     model.eval()
-    vqa_dataloader_1_batch = torch.utils.data.DataLoader(train_dataset, batch_size=1)
-    val_accuracy = eval_accuracy(model, val_dataloader, question_lang, answer_lang, f'{OUT_DIR}/{EXP_NAME}/val_pred.txt')
-    train_accuracy = eval_accuracy(model, vqa_dataloader_1_batch, question_lang, answer_lang, f'{OUT_DIR}/{EXP_NAME}/train_pred.txt')
+    train_loader_1_batch = torch.utils.data.DataLoader(train_dataset, batch_size=1)
+    val_accuracy, val_accuracy_amr = eval_accuracy_light(model, val_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/val_pred.txt')
+    train_accuracy, train_accuracy_amr = eval_accuracy_light(model, train_loader_1_batch, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/train_pred.txt')
+    test_accuracy, test_accuracy_amr = eval_accuracy_light(model, test_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/test_pred.txt')
     print(f'val {val_accuracy}')
     print(f'train {train_accuracy}')
+    print(f'test {test_accuracy}')
+    print(f'val amr {val_accuracy_amr}')
+    print(f'train amr {train_accuracy_amr}')
+    print(f'test amr {test_accuracy_amr}')
+
+    with open("{OUT_DIR}/{EXP_NAME}/results.txt", "w") as f:
+        f.write(f'val {val_accuracy}\n')
+        f.write(f'train {train_accuracy}\n')
+        f.write(f'test {test_accuracy}\n')
+        f.write(f'val amr {val_accuracy_amr}\n')
+        f.write(f'train amr {train_accuracy_amr}\n')
+        f.write(f'test amr {test_accuracy_amr}\n')
+
 
 if __name__ == '__main__':
     main()
