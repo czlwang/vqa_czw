@@ -377,7 +377,6 @@ class VQA_Model(nn.Module):
         fwd_final_hidden = final[0][0:final[0].size(0):2]
         bwd_final_hidden = final[0][1:final[0].size(0):2]
         final_hidden = torch.cat([fwd_final_hidden, bwd_final_hidden], dim=2)  # [num_layers, batch, 2*dim]
-        top_final_hidden = final_hidden[1]
 
         fwd_final_cell = final[1][0:final[1].size(0):2]
         bwd_final_cell = final[1][1:final[1].size(0):2]
@@ -389,23 +388,23 @@ class VQA_Model(nn.Module):
         im_embed = self.resnet(image)
         im_embed = im_embed.squeeze(-1)
         im_embed = im_embed.squeeze(-1)#shape is [batch, 2048, 1, 1] before squeezing
-        im_embed = torch.tanh(self.proj_im_1(im_embed))
+        im_embed = torch.relu(self.proj_im_1(im_embed))
         #im_embed = self.proj_im_2(im_embed)
         return im_embed
 
     def forward(self, question, lengths, image, amr, teacher_forcing_ratio=None):
         encoder_hidden, encoder_final = self.embed_question(question, lengths)
         bridge_hidden = self.init_hidden(encoder_final)
-        q_embed = torch.tanh(self.proj_q(bridge_hidden[0][1]))
+        q_embed = torch.relu(self.proj_q(bridge_hidden[0][0]))
 
         im_embed = self.embed_image(image)
 
-        #concat = torch.cat((q_embed, im_embed), dim=1)
         q_im_embed = torch.mul(q_embed, im_embed)
-        #q_im_embed = q_embed
-        q_im_embed = torch.tanh(self.fc1(q_im_embed))
-        q_im_embed = torch.tanh(self.fc2(q_im_embed))
-        q_im_embed = torch.tanh(self.fc3(q_im_embed))
+        bridge_hidden = (q_im_embed.unsqueeze(0), bridge_hidden[0])
+
+        q_im_embed = torch.relu(self.fc1(q_im_embed))
+        #q_im_embed = torch.tanh(self.fc2(q_im_embed))
+        #q_im_embed = torch.tanh(self.fc3(q_im_embed))
         pred = F.log_softmax(q_im_embed, dim=-1)
         amr_probs, _ = self.decoder(amr, encoder_hidden,
                                     lengths, bridge_hidden,
@@ -430,13 +429,15 @@ def run_epoch(model, vqa_dataloader, question_lang, answer_lang, amr_lang, crite
         loss = criterion(out, answer_tensors)
         loss += alpha*criterion(amr_probs, amr_tensor_trg)
         total_loss += loss.item()
+
         loss.backward()          
         optim.step()
         optim.zero_grad()
     return total_loss
 
-def eval_accuracy_light(model, vqa_dataloader, question_lang, answer_lang, amr_lang, out_file=None):
+def eval_accuracy(model, vqa_dataloader, question_lang, answer_lang, amr_lang, out_file=None):
     count, amr_count = 0.0, 0.0
+    denom = 0
     stripEOS = lambda x: re.sub("{}.*".format("EOS"), "", x)
     if out_file:
         f = open(out_file, "w")
@@ -449,13 +450,17 @@ def eval_accuracy_light(model, vqa_dataloader, question_lang, answer_lang, amr_l
         with torch.no_grad():
             out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, amr_tensor, teacher_forcing_ratio=0.0)
         max_tokens = torch.max(out,1)[1]
-        pred_answers = [answer_lang.getWord(x) for x in max_tokens]
+        pred_answers = [answer_lang.getWord(x.item()) for x in max_tokens]
         normalized_answers = [normalizeAnswerString(x) for x in batch["answer"]]
         count += sum([x==y for x,y in zip(pred_answers, normalized_answers)])
+        #print([x==y for x,y in zip(pred_answers, normalized_answers)])
+        #print(list(zip(pred_answers, normalized_answers)))
         trg_amrs = batch["amr"]
         pred_amrs = [' ' .join(indicesToWords(amr_lang, x)) for x in amr_tokens]
         pred_amrs = [stripEOS(x) for x in pred_amrs]
         amr_count += sum([x==y for x,y in zip(pred_amrs, trg_amrs)])
+        denom += len(pred_amrs)
+        #print(list(zip(pred_amrs, trg_amrs)))
 
         if out_file:
             for i in range(len(max_tokens)):
@@ -466,29 +471,8 @@ def eval_accuracy_light(model, vqa_dataloader, question_lang, answer_lang, amr_l
                 f.write(pred_amrs[i] + "\n\n")
     if out_file:
         f.close()
-    return count/len(vqa_dataloader), amr_count/len(vqa_dataloader)
- 
-def eval_accuracy(model, vqa_dataloader, question_lang, answer_lang, amr_lang, save_file=None):
-    """
-    assume batches are size 1
-    """
-    count = 0.0
-    with open(save_file, "w") as f:
-        for idx, batch in enumerate(vqa_dataloader):
-            question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
-            img = batch["image"]
-            question_tensor, lengths = batch_text(batch['question'], question_lang, EOS_TOKEN=True, SOS_TOKEN=False)
-            amr_tensor, amr_lengths = batch_text(batch['amr'], amr_lang, EOS_TOKEN=False, SOS_TOKEN=True)
-            with torch.no_grad():
-                out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, amr_tensor, teacher_forcing_ratio=0.0)
-            max_token = torch.max(out,1)[1].item()
-            pred_answer = answer_lang.getWord(max_token)
-            normalized_answer = normalizeAnswerString(batch["answer"][0])
-            trg_amr = ' '.join(batch["amr"])
-            if normalized_answer == pred_answer:
-                count += 1 
-    return count/len(vqa_dataloader) 
- 
+    return count/denom, amr_count/denom
+
 def indicesToWords(lang, sentence):
     return [lang.getWord(int(x)) for x in sentence]
 
@@ -500,28 +484,30 @@ def print_examples(model, vqa_dataloader, question_lang, answer_lang, amr_lang, 
         img = batch["image"]
         with torch.no_grad():
             out, amr_probs, amr_tokens = model.forward(question_tensor, lengths, img, amr_tensor, teacher_forcing_ratio=0.0)
-        max_tokens = torch.max(out,1)[1]
+        max_prob, max_tokens = torch.max(out,1)
+        #print(torch.exp(max_prob))
+        #print(torch.exp(out[0]))
 
         for count in range(len(batch['question'])):
-            print(f'Example {count}')
+            print(f'\nExample {count}')
             print("question: ", batch["question"][count])
             print("answer: ", batch["answer"][count])
-            print("amr: ", batch["amr"][count])
-            max_token = max_tokens[count]
+            max_token = max_tokens[count].item()
             print("pred answer: ", answer_lang.getWord(max_token))
+            print("amr: ", batch["amr"][count])
             pred_amr = ' '.join(indicesToWords(amr_lang, amr_tokens[count]))
             pred_amr = stripEOS(pred_amr)
             print("pred amr: ", pred_amr)
         
-        if count >= num_examples:
-            return
+            if count >= num_examples:
+                return
 
 def train(model, vqa_dataloader, val_dataloader, question_lang, answer_lang, amr_lang, num_epochs, optim, alpha):
     criterion = nn.NLLLoss(reduction="mean", ignore_index=amr_lang.PAD_TOKEN)
     max_acc = 0
     best_model_wts = None
     for epoch in range(num_epochs):
-        print(f'\nEpoch {epoch}')
+        print(f'\n***Epoch {epoch}***')
         model.train()
         loss = run_epoch(model, vqa_dataloader, question_lang, answer_lang, amr_lang, criterion, optim, teacher_forcing_ratio=1.0, alpha=alpha)
         writer.add_scalar("loss", loss, epoch)
@@ -529,17 +515,19 @@ def train(model, vqa_dataloader, val_dataloader, question_lang, answer_lang, amr
         model.eval()
         with torch.no_grad():
             print_examples(model, val_dataloader, question_lang, answer_lang, amr_lang)
-            val_accuracy, val_accuracy_amr = eval_accuracy_light(model, val_dataloader, question_lang, answer_lang, amr_lang)
-            print("val_accuracy", val_accuracy)
-            print("val_accuracy_amr", val_accuracy_amr)
-            writer.add_scalar("val_accuracy", val_accuracy, epoch)
-            writer.add_scalar("val_accuracy_amr", val_accuracy_amr, epoch)
-            if val_accuracy >= max_acc:
-                max_acc = val_accuracy
-                best_model_wts = copy.deepcopy(model.state_dict())
+            #val_accuracy, val_accuracy_amr = eval_accuracy(model, val_dataloader, question_lang, answer_lang, amr_lang)
+            #print("val_accuracy", val_accuracy)
+            #print("val_accuracy_amr", val_accuracy_amr)
+            #writer.add_scalar("val_accuracy", val_accuracy, epoch)
+            #writer.add_scalar("val_accuracy_amr", val_accuracy_amr, epoch)
+            #if val_accuracy >= max_acc:
+            #    max_acc = val_accuracy
+            #TODO indent the below line
+            best_model_wts = copy.deepcopy(model.state_dict())
     model.load_state_dict(best_model_wts)
     return model
 
+#TODO indent the below line
 # To keep things easy we also keep the `Softmax` class the same. 
 # It simply projects the pre-output layer ($x$ in the `forward` function below) to obtain the output layer, so that the final dimension is the target vocabulary size.
 class Softmax(nn.Module):
@@ -557,9 +545,9 @@ class Softmax(nn.Module):
 def make_model(question_lang, amr_lang, num_answers):
     resnet = torch.hub.load('pytorch/vision:v0.4.2', 'resnet50', pretrained=True) 
 
-    num_layers = 2
+    num_layers = 1
     emb_size = 200
-    dropout = 0.5
+    dropout = 0.0
     hidden_size = cfg["hidden_size"]
     question_vocab_size = question_lang.n_words
     amr_vocab_size = amr_lang.n_words
@@ -595,9 +583,9 @@ def make_splits():
     
     train_df = train_df.iloc[:cfg["num_train_examples"]]
     n_val = int(len(val_df)*cfg["val_test_split"])
-    val_df = val_df.iloc[:n_val]
+    val_df_temp = val_df.iloc[:n_val]
     test_df = val_df.iloc[n_val:]
-    return train_df, val_df, test_df
+    return train_df, val_df_temp, test_df
 
 def main():
     transform = transforms.Compose([transforms.Resize(224),
@@ -618,16 +606,15 @@ def main():
     question_lang, answer_lang, amr_lang = readQAText(train_df)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=cfg["batch_size"])
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=cfg["val_batch_size"])
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=cfg["val_batch_size"])
     model = make_model(question_lang, amr_lang, 1000)
     optim = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     model = train(model, train_loader, val_loader, question_lang, answer_lang,
           amr_lang, cfg["num_epochs"], optim, cfg["alpha"])
     model.eval()
-    train_loader_1_batch = torch.utils.data.DataLoader(train_dataset, batch_size=1)
-    val_accuracy, val_accuracy_amr = eval_accuracy_light(model, val_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/val_pred.txt')
-    train_accuracy, train_accuracy_amr = eval_accuracy_light(model, train_loader_1_batch, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/train_pred.txt')
-    test_accuracy, test_accuracy_amr = eval_accuracy_light(model, test_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/test_pred.txt')
+    val_accuracy, val_accuracy_amr = eval_accuracy(model, val_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/val_pred.txt')
+    train_accuracy, train_accuracy_amr = eval_accuracy(model, train_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/train_pred.txt')
+    test_accuracy, test_accuracy_amr = eval_accuracy(model, test_loader, question_lang, answer_lang, amr_lang, f'{OUT_DIR}/{EXP_NAME}/test_pred.txt')
     print(f'val {val_accuracy}')
     print(f'train {train_accuracy}')
     print(f'test {test_accuracy}')
@@ -635,7 +622,7 @@ def main():
     print(f'train amr {train_accuracy_amr}')
     print(f'test amr {test_accuracy_amr}')
 
-    with open("{OUT_DIR}/{EXP_NAME}/results.txt", "w") as f:
+    with open(f'{OUT_DIR}/{EXP_NAME}/results.txt', "w") as f:
         f.write(f'val {val_accuracy}\n')
         f.write(f'train {train_accuracy}\n')
         f.write(f'test {test_accuracy}\n')

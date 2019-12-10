@@ -1,2 +1,11 @@
-num_epochs: 2
-num_batches: 2
+alpha: 0.0
+val_batch_size: 128
+hidden_size: 512
+cuda: 2
+num_epochs: 60
+batch_size: 64
+num_train_examples: 1000
+lr: !!float 0.01
+val_test_split: 0.001
+out_dir: "dec-9"
+exp_name: "debug_med"
