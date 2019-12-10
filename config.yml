@@ -4,8 +4,8 @@ hidden_size: 512
 cuda: 0
 num_epochs: 60
 batch_size: 64
-num_train_examples: 138
+num_train_examples: 1000
 lr: !!float 0.001
-val_test_split: 0.01
+val_test_split: 0.05
 out_dir: "dec-10"
-exp_name: "tune_size_5k"
+exp_name: "tune_alpha_1.0"
