@@ -630,6 +630,7 @@ def main():
         f.write(f'test amr {test_accuracy_amr}\n')
 
     model.save(model.state_dict(), f'{OUT_DIR}/{EXP_NAME}/best_model.pt')
+    print("done")
 
 if __name__ == '__main__':
     main()
