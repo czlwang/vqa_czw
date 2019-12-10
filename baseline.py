@@ -515,15 +515,14 @@ def train(model, vqa_dataloader, val_dataloader, question_lang, answer_lang, amr
         model.eval()
         with torch.no_grad():
             print_examples(model, val_dataloader, question_lang, answer_lang, amr_lang)
-            #val_accuracy, val_accuracy_amr = eval_accuracy(model, val_dataloader, question_lang, answer_lang, amr_lang)
-            #print("val_accuracy", val_accuracy)
-            #print("val_accuracy_amr", val_accuracy_amr)
-            #writer.add_scalar("val_accuracy", val_accuracy, epoch)
-            #writer.add_scalar("val_accuracy_amr", val_accuracy_amr, epoch)
-            #if val_accuracy >= max_acc:
-            #    max_acc = val_accuracy
-            #TODO indent the below line
-            best_model_wts = copy.deepcopy(model.state_dict())
+            val_accuracy, val_accuracy_amr = eval_accuracy(model, val_dataloader, question_lang, answer_lang, amr_lang)
+            print("val_accuracy", val_accuracy)
+            print("val_accuracy_amr", val_accuracy_amr)
+            writer.add_scalar("val_accuracy", val_accuracy, epoch)
+            writer.add_scalar("val_accuracy_amr", val_accuracy_amr, epoch)
+            if val_accuracy >= max_acc:
+                max_acc = val_accuracy
+                best_model_wts = copy.deepcopy(model.state_dict())
     model.load_state_dict(best_model_wts)
     return model
 
