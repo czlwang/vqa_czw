@@ -402,9 +402,9 @@ class VQA_Model(nn.Module):
         q_im_embed = torch.mul(q_embed, im_embed)
         bridge_hidden = (q_im_embed.unsqueeze(0), bridge_hidden[0])
 
-        q_im_embed = torch.relu(self.fc1(q_im_embed))
+        #q_im_embed = torch.relu(self.fc1(q_im_embed))
         #q_im_embed = torch.tanh(self.fc2(q_im_embed))
-        #q_im_embed = torch.tanh(self.fc3(q_im_embed))
+        q_im_embed = torch.tanh(self.fc3(q_im_embed))
         pred = F.log_softmax(q_im_embed, dim=-1)
         amr_probs, _ = self.decoder(amr, encoder_hidden,
                                     lengths, bridge_hidden,
